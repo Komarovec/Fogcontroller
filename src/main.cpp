@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <WiFiUDP.h>
+#include <Timer.h>
 
 //Wifi
 const char* ssid = "KomarNetwork";
@@ -11,17 +11,21 @@ IPAddress apIP(192, 168, 1, 111);
 const char* ssidAP = "FOGTest";
 const char* passwordAP = "MYOP9317a";
 
+bool useAP = false;
+
+//Timers
+Timer qfTimer;
+
+
 //Server
 String request = "";
 char req[50];
 char *pch;
 
-//UDP Handling
-char data[200] = {};
-int packetsize = 0; 
-String receiveddata = "";
-WiFiUDP UDP;
-int UDPPort = 8099;
+//TCP
+WiFiServer server(22456); //TCP server
+const int tPort = 22457;
+WiFiClient client;
 int clientCount = 0; 
 
 //FogMachine Control
@@ -31,6 +35,7 @@ int FogOn = 0, FogOff = 0;
 bool timer = false;
 bool fogging = false;
 bool isLocked = false;
+bool quickFogging = false;
 unsigned long waitTime = 0;
 unsigned long syncTime = 0;
 bool isHeated = false;
@@ -43,7 +48,9 @@ typedef struct {
 
 CLIENTS clientList[50];
 
+//Fuctions Init
 void refreshValues(IPAddress ip, int port);
+void endQuickFog();
 void quickFog();
 void setTimer();
 void setRed();
@@ -52,53 +59,62 @@ void timerCheck();
 void printClients();
 void addToList(IPAddress ip, int port, char *nick);
 int IPInList(IPAddress ip);
-void broadcastUDP(char *data, int port);
-void sendUDP(IPAddress ip, int port, char *data);
-void UDPHandling();
+void broadcastTCP(char *data, int port);
+void sendTCP(IPAddress ip, int port, char *data);
+void TCPHandling();
 
 //Functions
 void refreshValues(IPAddress ip, int port) {
   if(analogRead(heated) > 600) {
-    sendUDP(ip, port, "ready");
+    sendTCP(ip, port, "ready");
   }
   else if(analogRead(heated) < 100) {
-    sendUDP(ip, port, "cold");
+    sendTCP(ip, port, "cold");
   }
   
   
   if(isLocked) {
-    sendUDP(ip, port, "locked");
+    sendTCP(ip, port, "locked");
   }
   else if(fogging) {
-    sendUDP(ip, port, "fog");
+    sendTCP(ip, port, "fog");
   }
   else if(timer) {
       char msg[50] = {};
       strcpy(msg,"timer:");
       int timeToWait = (int)(waitTime-millis())/1000;
       strcat(msg,String(timeToWait).c_str());
-      sendUDP(ip, port, msg);
+      sendTCP(ip, port, msg);
   }
   else {
-    sendUDP(ip, port, "reset");
+    sendTCP(ip, port, "reset");
   }
 }
 
 void quickFog() {
-  if(isLocked || !isHeated) return;
+  if(isLocked || !isHeated || quickFogging) return; //If fog cant operate
+    
+  //Fog
   fogging = true;
-  broadcastUDP("fog", 8100);
+  quickFogging = true;
+  broadcastTCP("fog", tPort);
   digitalWrite(relay, LOW);
-  delay(2000);
-  if(timer) {
+  int afterFog = qfTimer.after(2000, endQuickFog);
+}
+
+void endQuickFog() {
+  //Stop Fog
+  quickFogging = false;
+  if(timer) { //When Timer 
     char msg[50] = {};
     strcpy(msg,"timer:");
     int timeToWait = (int)(waitTime-millis())/1000;
     strcat(msg,String(timeToWait).c_str());
-    broadcastUDP(msg, 8100);
+    broadcastTCP(msg, tPort);
   }
   else
-    broadcastUDP("reset", 8100);
+  Serial.println("QuickFog Off");
+  broadcastTCP("reset", tPort);
   digitalWrite(relay, HIGH);
   fogging = false;
   return;
@@ -119,7 +135,7 @@ void setTimer() {
       strcpy(msg,"timer:");
       strcat(msg,String(FogOff).c_str());
       fogging = true;
-      broadcastUDP(msg, 8100);
+      broadcastTCP(msg, tPort);
    }
 }
 
@@ -132,10 +148,10 @@ void setRed() {
     digitalWrite(relay, !fogging);
 
     if(fogging) {
-      broadcastUDP("redh", 8100);
+      broadcastTCP("redh", tPort);
     }
     else {
-      broadcastUDP("reset", 8100);
+      broadcastTCP("reset", tPort);
     }
   }
   else {
@@ -149,7 +165,7 @@ void resetState() {
   fogging = false;
   digitalWrite(relay, HIGH);
   waitTime = 0;
-  broadcastUDP("reset", 8100);
+  broadcastTCP("reset", tPort);
 }
 
 void timerCheck() {
@@ -162,7 +178,7 @@ void timerCheck() {
     char msg[50] = {};
     strcpy(msg,"timer:");
     strcat(msg,String(FogOff).c_str());
-    broadcastUDP(msg, 8100);
+    broadcastTCP(msg, tPort);
     
     Serial.println("FogOff");
   }
@@ -172,7 +188,7 @@ void timerCheck() {
       digitalWrite(relay, LOW);
       waitTime = millis() + (FogOn*1000);
   
-      broadcastUDP("fog", 8100);
+      broadcastTCP("fog", tPort);
       
       Serial.println("FogOn");
     }
@@ -184,7 +200,7 @@ void timerCheck() {
       char msg[50] = {};
       strcpy(msg,"timer:");
       strcat(msg,String(FogOff).c_str());
-      broadcastUDP(msg, 8100);
+      broadcastTCP(msg, tPort);
       
       Serial.println("Cant fog on timer - not heated");
     }
@@ -213,7 +229,7 @@ void addToList(IPAddress ip, int port, char *nick) {
     refreshValues(ip, port);
   }
   clientList[clientCount].nick = nick;
-  sendUDP(ip, port, "registered");
+  sendTCP(ip, port, "registered");
 }
 
 int IPInList(IPAddress ip) {
@@ -225,46 +241,52 @@ int IPInList(IPAddress ip) {
   return -1;
 }
 
-//UDP Com
-void broadcastUDP(char *data, int port) {
+//TCP Com
+void broadcastTCP(char *data, int port) {
   for(int i = 0; i < clientCount; i++) {
-    sendUDP(clientList[i].ip, port, data);
+    sendTCP(clientList[i].ip, port, data);
   }
 }
 
-void sendUDP(IPAddress ip, int port, char *data) {
-    UDP.beginPacket(ip, port);
-    UDP.write(data);
-    UDP.endPacket();
+void sendTCP(IPAddress ip, int port, char *msg) {
+  client.connect(ip.toString(), port);
+  client.print(msg);
+  client.flush();
+  client.stop();
 }
 
-void UDPHandling() {
-    char message = UDP.parsePacket();
-    packetsize = UDP.available();
-    IPAddress remoteip;
-    int remoteport;
-    if(message) { 
-      Serial.printf("Packet received!\n");
-      UDP.read(data,packetsize);
-      delay(100);
-      remoteip = UDP.remoteIP();
-      remoteport = UDP.remotePort();
-      delay(100);
+void TCPHandling() {
+  if (!client.connected()) {
+    // try to connect to a new client
+    client = server.available();
+    delay(10);
+  } 
+  else {
+    // read data from the connected client
+    String data = "";
+    char c;
+    while(client.available() > 0) {
+        c = client.read();
+        data += c;
     }
 
-    if(packetsize) {
-      for (int i=0;packetsize > i ;i++) {
-        receiveddata+= (char)data[i];
-      } 
-      Serial.println(receiveddata);
-
-      //Register
-      if(receiveddata.indexOf("register") == 0) {
+    //If packet
+    if(data != "") {
+      Serial.printf("Packet received: ");
+      Serial.println(data);
+      IPAddress remoteip = client.remoteIP();
+      int remoteport = tPort;
+      if(data.indexOf("register") == 0) {
         char dt[50] = {};
-        char *nick;
-        strcpy(dt, receiveddata.c_str());
+        char *nick = NULL;
+        strcpy(dt, data.c_str());
         pch = strtok(dt, ":");
         nick = strtok(NULL, ":");
+        if(nick == NULL) {
+          data="";
+          Serial.println("Can't register without nick!");
+          return;
+        }
         Serial.printf("registering: %s\n", nick);
         addToList(remoteip, remoteport, nick);
         refreshValues(remoteip, remoteport);
@@ -275,80 +297,92 @@ void UDPHandling() {
         clientCount++;
         printClients();
       }
-      else if(receiveddata == "LOCK") {
+      else if(data == "LOCK") {
         if(!isLocked) {
           isLocked = true;
           digitalWrite(relay, HIGH);
           timer = false;
           fogging = false;
-          broadcastUDP("locked",8100);
+          broadcastTCP("locked",tPort);
         }
       }
-      else if(receiveddata == "UNLOCK") {
+      else if(data == "UNLOCK") {
         if(isLocked) {
-          broadcastUDP("unlocked",8100);
+          broadcastTCP("unlocked",tPort);
           isLocked = false;
         }
       }
-      else if(receiveddata == "QF") {
+      else if(data == "QF") {
         quickFog();
       }
-      else if(receiveddata == "RED") {
+      else if(data == "RED") {
         setRed();
       } 
-      else if(receiveddata == "RESET") {
+      else if(data == "RESET") {
         resetState();
       }
-      else if(receiveddata == "refresh") {
+      else if(data == "refresh") {
         refreshValues(remoteip, remoteport);
       }
-      else if(receiveddata.indexOf("TIM") == 0) {
+      else if(data.indexOf("TIM") == 0) {
         char dt[50] = {};
-        strcpy(dt, receiveddata.c_str());
+        pch = NULL;
+        strcpy(dt, data.c_str());
         pch = strtok(dt, ":");
+        if(pch == NULL) {
+          Serial.println("Can't set timer!");
+          return;
+        }
         pch = strtok(NULL, ":");
+        if(pch == NULL) {
+          Serial.println("Can't set timer!");
+          return;
+        }
         FogOn = atoi(pch);
         pch = strtok(NULL, ":");
+        if(pch == NULL) {
+          Serial.println("Can't set timer!");
+          return;
+        }
         FogOff = atoi(pch);
         setTimer(); 
       }
-     
-      receiveddata="";
     }
-    delay(100);
+  }
 }
 
 //Setup
 void setup() {
   //Seriová linka
-  Serial.begin(115200);
+  Serial.begin(9600);
 
-  //Wifi RouterConnect
-  /*
-  Serial.print("Connecting to ");
-  Serial.println(ssid); 
-  WiFi.begin(ssid, password); 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);                          
-    Serial.print(".");                    
+  if(!useAP) {
+    //WiFi RouterConnect
+    Serial.print("Connecting to ");
+    Serial.println(ssid); 
+    WiFi.begin(ssid, password); 
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);                          
+        Serial.print(".");                    
+    }
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-  */
+  else {
+    //Access Point
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));   // subnet FF FF FF 00  
+    WiFi.softAP(ssidAP, passwordAP);
+    IPAddress myIP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(myIP);
+  }
 
-  //Access Point
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));   // subnet FF FF FF 00  
-  WiFi.softAP(ssidAP, passwordAP);
-  IPAddress myIP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(myIP);
-
-  //Server 
-  UDP.begin(UDPPort);
-  Serial.println("UDP Server started");
+  //TCP Server
+  server.begin();
+  Serial.println("TCP Server started");
 
   //Relé
   pinMode(relay, OUTPUT);
@@ -357,26 +391,27 @@ void setup() {
 
 //Loop
 void loop() {
-  UDPHandling();
+  TCPHandling();
   timerCheck();
+  qfTimer.update();
 
   //Check Heat
   if(analogRead(heated) > 600 && !isHeated) {
     isHeated = true;
     if(!fogging) {
-      broadcastUDP("ready",8100);
+      broadcastTCP("ready",tPort);
     }
     else if(timer && fogging) {
-      broadcastUDP("ready",8100);
-      broadcastUDP("fog",8100);
+      broadcastTCP("ready",tPort);
+      broadcastTCP("fog",tPort);
     }
     else {
-      broadcastUDP("ready",8100);
-      broadcastUDP("redh",8100);
+      broadcastTCP("ready",tPort);
+      broadcastTCP("redh",tPort);
     }
   }
   else if(analogRead(heated) < 100 && isHeated) {
     isHeated = false;
-    broadcastUDP("cold",8100);
+    broadcastTCP("cold",tPort);
   }
 }
