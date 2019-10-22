@@ -4,12 +4,12 @@
 
 //Wifi
 const char* ssid = "KomarNetwork";
-const char* password = "MYOP9317a";
+const char* password = "****";
 
 //Access point
 IPAddress apIP(192, 168, 1, 111);
 const char* ssidAP = "FOGTest";
-const char* passwordAP = "MYOP9317a";
+const char* passwordAP = "****";
 
 bool useAP = false;
 
